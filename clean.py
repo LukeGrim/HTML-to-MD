@@ -72,7 +72,7 @@ def get_output_path(input_path: str, output_dir: str = "output") -> str:
 def fetch_url(url: str) -> str:
     """Fetch HTML content from a URL."""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows 11; Win64; x64)'
     }
     request = urllib.request.Request(url, headers=headers)
     
@@ -98,7 +98,7 @@ def fetch_url(url: str) -> str:
 def remove_non_content_elements(soup: BeautifulSoup) -> None:
     """Remove elements that don't contribute to main content."""
     # Remove script, style, and other non-content tags
-    for tag_name in ['script', 'style', 'nav', 'footer', 'header', 'aside', 'table', 'noscript', 'iframe']:
+    for tag_name in ['script', 'style', 'nav', 'footer', 'header', 'aside', 'table', 'noscript', 'iframe', 'button']:
         for tag in soup.find_all(tag_name):
             tag.decompose()
     
@@ -106,11 +106,63 @@ def remove_non_content_elements(soup: BeautifulSoup) -> None:
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
 
-def remove_links(soup: BeautifulSoup) -> None:
-    """Remove all anchor tags and their contents from the document."""
-    for anchor in soup.find_all('a'):
-        anchor.decompose()
+def remove_ui_elements(soup: BeautifulSoup) -> None:
+    """Remove common UI elements like sidebars, TOCs, and navigation by class/ID patterns."""
+    # Patterns that indicate UI chrome rather than content
+    ui_class_patterns = ['sidebar', 'toc', 'table-of-contents', 'breadcrumb', 'navigation', 
+                         'nav-', 'menu', 'search', 'skip-to', 'toolbar']
+    ui_id_patterns = ['sidebar', 'toc', 'table-of-contents', 'navigation', 'breadcrumb',
+                      'menu', 'search']
+    
+    # Collect elements to remove (to avoid modifying while iterating)
+    elements_to_remove = []
+    
+    # Find elements by class
+    for element in soup.find_all(class_=True):
+        if element.attrs is None:
+            continue
+        classes = element.get('class', [])
+        if classes:
+            class_str = ' '.join(classes).lower()
+            if any(pattern in class_str for pattern in ui_class_patterns):
+                elements_to_remove.append(element)
+    
+    # Find elements by ID
+    for element in soup.find_all(id=True):
+        if element.attrs is None:
+            continue
+        elem_id = element.get('id', '')
+        if elem_id:
+            elem_id_lower = elem_id.lower()
+            if any(pattern in elem_id_lower for pattern in ui_id_patterns):
+                elements_to_remove.append(element)
+    
+    # Remove collected elements
+    for element in elements_to_remove:
+        if element.parent is not None:  # Element still in tree
+            element.decompose()
 
+def remove_links(soup: BeautifulSoup) -> None:
+    """Remove links but keep the anchor text in place."""
+    for anchor in soup.find_all('a'):
+        anchor.unwrap()
+def extract_title(soup: BeautifulSoup) -> str:
+    """Extract the page title from <title> tag."""
+    title_tag = soup.find('title')
+    if title_tag:
+        title_text = title_tag.get_text(strip=True)
+        title_tag.decompose()
+        return title_text
+    return ""
+
+def convert_code_blocks(soup: BeautifulSoup) -> None:
+    """Convert <pre> and <code> blocks to markdown fenced code blocks."""
+    for pre in soup.find_all('pre'):
+        # Get raw text content, preserving internal whitespace
+        code_text = pre.get_text()
+        # Wrap in fenced code block
+        fenced = f"\n\n```\n{code_text}\n```\n\n"
+        pre.replace_with(fenced)
 def convert_headings(soup: BeautifulSoup) -> None:
     """Convert h1-h6 tags to markdown heading markers."""
     for level in range(1, 7):
@@ -122,25 +174,108 @@ def convert_headings(soup: BeautifulSoup) -> None:
             else:
                 heading.decompose()
 
-def convert_lists(soup: BeautifulSoup) -> None:
-    """Convert list items to markdown format."""
-    # Handle unordered lists
-    for ul in soup.find_all('ul'):
-        for li in ul.find_all('li', recursive=False):
-            text = li.get_text(strip=True)
-            if text:
-                li.replace_with(f"\n- {text}")
+def convert_list_item(li, indent_level: int = 0, ordered: bool = False, index: int = 1) -> str:
+    """Recursively convert a list item and its nested lists to markdown."""
+    indent = "    " * indent_level
+    result_lines = []
     
-    # Handle ordered lists
-    for ol in soup.find_all('ol'):
-        for idx, li in enumerate(ol.find_all('li', recursive=False), start=1):
-            text = li.get_text(strip=True)
+    # Get direct text content (not from nested lists)
+    # Clone the li to work with
+    direct_text_parts = []
+    for child in li.children:
+        if hasattr(child, 'name') and child.name in ['ul', 'ol']:
+            continue  # Skip nested lists for now
+        if hasattr(child, 'get_text'):
+            direct_text_parts.append(child.get_text(strip=True))
+        elif isinstance(child, str):
+            text = child.strip()
             if text:
-                li.replace_with(f"\n{idx}. {text}")
+                direct_text_parts.append(text)
+    
+    direct_text = ' '.join(direct_text_parts).strip()
+    
+    # Create the list item marker
+    if ordered:
+        marker = f"{index}."
+    else:
+        marker = "-"
+    
+    if direct_text:
+        result_lines.append(f"{indent}{marker} {direct_text}")
+    
+    # Process nested lists
+    for nested_ul in li.find_all('ul', recursive=False):
+        for nested_li in nested_ul.find_all('li', recursive=False):
+            nested_result = convert_list_item(nested_li, indent_level + 1, ordered=False)
+            if nested_result:
+                result_lines.append(nested_result)
+    
+    for nested_ol in li.find_all('ol', recursive=False):
+        for idx, nested_li in enumerate(nested_ol.find_all('li', recursive=False), start=1):
+            nested_result = convert_list_item(nested_li, indent_level + 1, ordered=True, index=idx)
+            if nested_result:
+                result_lines.append(nested_result)
+    
+    return '\n'.join(result_lines)
+
+def convert_lists(soup: BeautifulSoup) -> None:
+    """Convert list items to markdown format with proper nesting."""
+    # Process only top-level lists (not nested ones)
+    for ul in soup.find_all('ul'):
+        # Skip if this ul is nested inside another list
+        if ul.find_parent(['ul', 'ol']):
+            continue
+        
+        list_lines = []
+        for li in ul.find_all('li', recursive=False):
+            item_text = convert_list_item(li, indent_level=0, ordered=False)
+            if item_text:
+                list_lines.append(item_text)
+        
+        if list_lines:
+            ul.replace_with('\n' + '\n'.join(list_lines) + '\n')
+        else:
+            ul.decompose()
+    
+    for ol in soup.find_all('ol'):
+        # Skip if this ol is nested inside another list
+        if ol.find_parent(['ul', 'ol']):
+            continue
+        
+        list_lines = []
+        for idx, li in enumerate(ol.find_all('li', recursive=False), start=1):
+            item_text = convert_list_item(li, indent_level=0, ordered=True, index=idx)
+            if item_text:
+                list_lines.append(item_text)
+        
+        if list_lines:
+            ol.replace_with('\n' + '\n'.join(list_lines) + '\n')
+        else:
+            ol.decompose()
+
+def add_inline_spacing(soup: BeautifulSoup) -> None:
+    """Add spaces around inline elements to prevent word concatenation."""
+    inline_tags = ['code', 'strong', 'em', 'b', 'i', 'span']
+    
+    for tag_name in inline_tags:
+        for tag in soup.find_all(tag_name):
+            # Check if we need to add space before
+            prev_sibling = tag.previous_sibling
+            if prev_sibling and isinstance(prev_sibling, str) and prev_sibling and not prev_sibling.endswith((' ', '\n', '\t')):
+                tag.insert_before(' ')
+            
+            # Check if we need to add space after
+            next_sibling = tag.next_sibling
+            if next_sibling and isinstance(next_sibling, str) and next_sibling and not next_sibling.startswith((' ', '\n', '\t')):
+                tag.insert_after(' ')
+            
+            # Unwrap the tag (keep content, remove markup)
+            tag.unwrap()
 
 def add_block_spacing(soup: BeautifulSoup) -> None:
     """Add spacing markers for block-level elements."""
-    block_tags = ['p', 'div', 'section', 'article', 'blockquote', 'pre']
+    # Note: 'pre' is handled separately by convert_code_blocks
+    block_tags = ['p', 'div', 'section', 'article', 'blockquote']
     
     for tag_name in block_tags:
         for tag in soup.find_all(tag_name):
@@ -168,31 +303,97 @@ def normalize_whitespace(text: str) -> str:
     
     return text
 
+def remove_feedback_patterns(text: str) -> str:
+    """Remove common UI feedback widget patterns."""
+    # Remove "Was this page helpful?" and similar patterns
+    patterns = [
+        r'Was this page helpful\??\s*',
+        r'\bYes\s*No\b',
+        r'YesNo\b',
+        r'Rate this page.*',
+        r'Give feedback.*',
+        r'Edit this page.*',
+        r'⌘[A-Z]',  # Keyboard shortcut indicators like ⌘K
+    ]
+    
+    for pattern in patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    return text
+
+def remove_empty_sections(text: str) -> str:
+    """Remove headings that have no content before the next heading."""
+    lines = text.split('\n')
+    result = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # Check if this is a heading line
+        if line.strip().startswith('#'):
+            # Look ahead to see if next non-empty line is also a heading
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            
+            # If we reached end of file or next content is a heading, skip this heading
+            if j >= len(lines) or lines[j].strip().startswith('#'):
+                i += 1
+                continue
+        
+        result.append(line)
+        i += 1
+    
+    return '\n'.join(result)
+
 def html_to_markdown(html_content: str) -> str:
     """Convert HTML content to clean markdown text."""
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # Step 1: Remove non-content elements
+    # Step 1: Extract title before removing elements
+    title = extract_title(soup)
+    
+    # Step 2: Remove non-content elements (scripts, styles, nav, etc.)
     remove_non_content_elements(soup)
     
-    # Step 2: Remove all links
+    # Step 3: Remove UI chrome (sidebars, TOCs, breadcrumbs by class/ID)
+    remove_ui_elements(soup)
+    
+    # Step 4: Remove link markup (keep anchor text)
     remove_links(soup)
     
-    # Step 3: Convert headings to markdown
+    # Step 5: Add spacing around inline elements before unwrapping
+    add_inline_spacing(soup)
+    
+    # Step 6: Convert code blocks to fenced markdown
+    convert_code_blocks(soup)
+    
+    # Step 7: Convert headings to markdown
     convert_headings(soup)
     
-    # Step 4: Convert lists to markdown
+    # Step 8: Convert lists to markdown (with nesting support)
     convert_lists(soup)
     
-    # Step 5: Add spacing for block elements
+    # Step 9: Add spacing for block elements
     add_block_spacing(soup)
     
-    # Step 6: Extract text and normalize whitespace
+    # Step 10: Extract text and normalize whitespace
     text = soup.get_text()
     text = normalize_whitespace(text)
     
-    # Step 7: Add conversion notice at top
-    notice = "> [This file is converted from HTML. Links have been removed.]\n\n"
+    # Step 11: Remove common feedback UI patterns
+    text = remove_feedback_patterns(text)
+    
+    # Step 12: Remove empty sections (headings with no content)
+    text = remove_empty_sections(text)
+    
+    # Step 13: Add title as H1 if extracted
+    if title:
+        text = f"# {title}\n\n{text}"
+    
+    # Step 14: Add conversion notice at top
+    notice = "> [This file is converted from HTML. Non-primary content has been removed while trying to preserve structure.]\n\n"
     text = notice + text
     
     return text
