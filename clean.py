@@ -13,14 +13,24 @@ Usage:
 Arguments:
     input - One or more paths to HTML files or URLs to fetch HTML from
 
+Options:
+    --wait-time MS   Time to wait for JS rendering in milliseconds (default: 5000)
+    --render-js      Always use headless browser for URLs (requires playwright)
+    --no-render-js   Never use headless browser, even for JS-rendered pages
+
 Examples:
     python clean.py https://example.com/page
     python clean.py page.html
     python clean.py page1.html page2.html page3.html
     python clean.py page.html https://example.com/page
+    python clean.py --render-js https://spa-website.com/page
+    python clean.py --render-js --wait-time 10000 https://slow-spa.com/page
 
 Dependencies:
     beautifulsoup4 (pip install beautifulsoup4)
+
+Optional Dependencies (for JavaScript-rendered pages):
+    playwright (pip install playwright && playwright install chromium)
 """
 
 import argparse
@@ -36,6 +46,62 @@ try:
 except ImportError:
     print("Error: BeautifulSoup is not installed. Install with 'pip install beautifulsoup4'")
     sys.exit(1)
+
+# Optional dependency for JavaScript rendering
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+# SPA framework indicators that suggest JavaScript-rendered content
+SPA_INDICATORS = [
+    '__sveltekit_',      # SvelteKit
+    '__NEXT_DATA__',     # Next.js
+    '__NUXT__',          # Nuxt.js (Vue)
+    'window.__remixContext',  # Remix
+    '_app/immutable/',   # SvelteKit assets
+    'react-root',        # React
+    'data-reactroot',    # React
+]
+
+def detect_js_rendered_content(soup: BeautifulSoup, html_content: str) -> bool:
+    """
+    Detect if the page content is rendered by JavaScript (SPA).
+    """
+    # Check for SPA framework indicators in raw HTML
+    has_spa_indicator = any(indicator in html_content for indicator in SPA_INDICATORS)
+    
+    if not has_spa_indicator:
+        return False
+    
+    # Check if main content containers are empty or near-empty
+    # Look for common content containers
+    content_containers = (
+        soup.find('main') or 
+        soup.find('article') or 
+        soup.find(class_=lambda c: c and 'main-content' in ' '.join(c).lower() if isinstance(c, list) else 'main-content' in c.lower() if c else False) or
+        soup.find(id=lambda i: i and 'content' in i.lower() if i else False)
+    )
+    
+    if content_containers:
+        # Get text content, ignoring scripts and styles
+        for tag in content_containers.find_all(['script', 'style']):
+            tag.decompose()
+        text_content = content_containers.get_text(strip=True)
+        # If main content area has very little text, it's likely JS-rendered
+        if len(text_content) < 100:
+            return True
+    
+    # Check for empty placeholder divs that are common in SPAs
+    # e.g., <div id="app"></div>, <div id="root"></div>, <div id="__next"></div>
+    spa_root_ids = ['app', 'root', '__next', 'scalar-api-reference', 'application']
+    for root_id in spa_root_ids:
+        element = soup.find(id=root_id)
+        if element and not element.get_text(strip=True):
+            return True
+    
+    return False
 
 def is_url(path: str) -> bool:
     """Check if the given path is a URL."""
@@ -95,6 +161,34 @@ def fetch_url(url: str) -> str:
         print(f"Error: Unable to decode content from '{url}' as UTF-8.")
         sys.exit(1)
 
+def fetch_url_with_js(url: str, timeout: int = 30000, wait_time: int = 5000) -> str:
+    """Fetch URL using headless browser to render JavaScript.
+    
+    Args:
+        url: The URL to fetch
+        timeout: Navigation timeout in milliseconds (default 30 seconds)
+        wait_time: Additional time to wait after networkidle for JS rendering (default 5 seconds)
+    
+    Returns:
+        The fully rendered HTML content
+    
+    Raises:
+        Exception: If browser fails to launch or page fails to load
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.goto(url, timeout=timeout)
+            page.wait_for_load_state('networkidle')
+            # Additional wait for JS frameworks to finish rendering
+            if wait_time > 0:
+                page.wait_for_timeout(wait_time)
+            html = page.content()
+            return html
+        finally:
+            browser.close()
+
 def remove_non_content_elements(soup: BeautifulSoup) -> None:
     """Remove elements that don't contribute to main content."""
     # Remove script, style, and other non-content tags
@@ -106,13 +200,18 @@ def remove_non_content_elements(soup: BeautifulSoup) -> None:
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
 
+# Tags that should never be removed by UI pattern matching (main content containers)
+PROTECTED_CONTENT_TAGS = ['body', 'main', 'article', 'section']
+
 def remove_ui_elements(soup: BeautifulSoup) -> None:
     """Remove common UI elements like sidebars, TOCs, and navigation by class/ID patterns."""
     # Patterns that indicate UI chrome rather than content
+    # Note: Use specific patterns to avoid false positives on content IDs like 'web-search'
     ui_class_patterns = ['sidebar', 'toc', 'table-of-contents', 'breadcrumb', 'navigation', 
-                         'nav-', 'menu', 'search', 'skip-to', 'toolbar']
+                         'nav-', 'menu', 'search-box', 'search-form', 'search-input', 
+                         'searchbar', 'search-widget', 'skip-to', 'toolbar']
     ui_id_patterns = ['sidebar', 'toc', 'table-of-contents', 'navigation', 'breadcrumb',
-                      'menu', 'search']
+                      'menu', 'search-box', 'search-form', 'search-input', 'searchbar']
     
     # Collect elements to remove (to avoid modifying while iterating)
     elements_to_remove = []
@@ -140,6 +239,8 @@ def remove_ui_elements(soup: BeautifulSoup) -> None:
     # Remove collected elements
     for element in elements_to_remove:
         if element.parent is not None:  # Element still in tree
+            if element.name in PROTECTED_CONTENT_TAGS:
+                continue  # Don't remove main content containers
             element.decompose()
 
 def remove_links(soup: BeautifulSoup) -> None:
@@ -347,8 +448,23 @@ def remove_empty_sections(text: str) -> str:
     
     return '\n'.join(result)
 
-def html_to_markdown(html_content: str) -> str:
-    """Convert HTML content to clean markdown text."""
+def html_to_markdown(html_content: str, used_js_rendering: bool = False) -> tuple[str, bool]:
+    """Convert HTML content to clean markdown text.
+    
+    Args:
+        html_content: The HTML string to convert
+        used_js_rendering: Whether headless browser was used to render this content
+    
+    Returns:
+        tuple: (markdown_content, is_js_rendered) where is_js_rendered indicates
+               if the content appears to be JavaScript-rendered (SPA).
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Detect JS-rendered content before modifying the soup
+    is_js_rendered = detect_js_rendered_content(soup, html_content)
+    
+    # Re-parse since detection may have modified the soup
     soup = BeautifulSoup(html_content, 'html.parser')
     
     # Step 1: Extract title before removing elements
@@ -393,18 +509,68 @@ def html_to_markdown(html_content: str) -> str:
         text = f"# {title}\n\n{text}"
     
     # Step 14: Add conversion notice at top
-    notice = "> [This file is converted from HTML. Non-primary content has been removed while trying to preserve structure.]\n\n"
+    if used_js_rendering:
+        notice = "> [This file is converted from HTML using headless browser rendering. Non-primary content has been removed while trying to preserve structure.]\n\n"
+    elif is_js_rendered:
+        notice = "> [This file is converted from HTML. Non-primary content has been removed while trying to preserve structure.]\n>\n> **Warning: This page appears to use JavaScript rendering. The main content may be missing because a headless browser was not used before conversion.**\n\n"
+    else:
+        notice = "> [This file is converted from HTML. Non-primary content has been removed while trying to preserve structure.]\n\n"
     text = notice + text
     
-    return text
+    return text, is_js_rendered
 
-def process_input(input_path: str, output_dir: str) -> bool:
-    """Process a single input file or URL. Returns True on success."""
+def process_input(input_path: str, output_dir: str, render_js_mode: str = 'auto', wait_time: int = 5000) -> bool:
+    """Process a single input file or URL. Returns True on success.
+    
+    Args:
+        input_path: Path to HTML file or URL
+        output_dir: Directory to write output markdown files
+        render_js_mode: 'auto' (default), 'always', or 'never'
+            - 'auto': Use Playwright only when JS rendering is detected
+            - 'always': Always use Playwright for URLs (requires playwright)
+            - 'never': Never use Playwright, just warn about JS content
+        wait_time: Time to wait for JS rendering in milliseconds (default 5000)
+    """
     output_path = get_output_path(input_path, output_dir)
+    used_js_rendering = False
     
     # Read HTML from file or URL
     if is_url(input_path):
-        html_content = fetch_url(input_path)
+        # For 'always' mode, use Playwright directly
+        if render_js_mode == 'always':
+            if not PLAYWRIGHT_AVAILABLE:
+                print(f"Error: --render-js requires playwright. Install with:")
+                print(f"       pip install playwright && playwright install chromium")
+                return False
+            try:
+                print(f"Rendering '{input_path}' with headless browser...")
+                html_content = fetch_url_with_js(input_path, wait_time=wait_time)
+                used_js_rendering = True
+            except Exception as e:
+                print(f"Error: Failed to render '{input_path}' with headless browser: {e}")
+                return False
+        else:
+            # Start with simple fetch
+            html_content = fetch_url(input_path)
+            
+            # Check if JS rendering is needed (only for 'auto' mode)
+            if render_js_mode == 'auto':
+                soup = BeautifulSoup(html_content, 'html.parser')
+                is_js_page = detect_js_rendered_content(soup, html_content)
+                
+                if is_js_page:
+                    if PLAYWRIGHT_AVAILABLE:
+                        # Try to render with Playwright
+                        try:
+                            print(f"  JS rendering detected, re-fetching '{input_path}' with headless browser...")
+                            html_content = fetch_url_with_js(input_path, wait_time=wait_time)
+                            used_js_rendering = True
+                        except Exception as e:
+                            print(f"  Warning: Failed to render JavaScript for '{input_path}': {e}")
+                            print(f"           Falling back to static HTML. Content may be incomplete.")
+                    else:
+                        # Playwright not available, will show warning later
+                        pass
     else:
         try:
             with open(input_path, 'r', encoding='utf-8') as f:
@@ -416,11 +582,11 @@ def process_input(input_path: str, output_dir: str) -> bool:
             print(f"Error: Permission denied reading '{input_path}'.")
             return False
         except UnicodeDecodeError:
-            print(f"Error: Unable to decode '{input_path}' as UTF-8. Try a different encoding.")
+            print(f"Error: Unable to decode '{input_path}' as UTF-8.")
             return False
     
     # Convert to markdown
-    markdown_content = html_to_markdown(html_content)
+    markdown_content, is_js_rendered = html_to_markdown(html_content, used_js_rendering)
     
     # Write markdown file
     try:
@@ -434,6 +600,17 @@ def process_input(input_path: str, output_dir: str) -> bool:
         return False
     
     print(f"Converted '{input_path}' -> '{output_path}'")
+    
+    # Show appropriate message based on what happened
+    if used_js_rendering:
+        print(f"  Note: Content was rendered using a headless browser.")
+    elif is_js_rendered:
+        # JS was detected but we didn't render it
+        print(f"  Warning: '{input_path}' appears to be JavaScript-rendered and . Content may be incomplete.")
+        if not PLAYWRIGHT_AVAILABLE:
+            print(f"  Tip: Install playwright for automatic JS rendering:")
+            print(f"       pip install playwright && playwright install chromium")
+    
     return True
 
 def main():
@@ -451,7 +628,35 @@ def main():
         help='Output directory for markdown files (default: output)'
     )
     
+    # JS rendering options (mutually exclusive)
+    js_group = parser.add_mutually_exclusive_group()
+    js_group.add_argument(
+        '--render-js',
+        action='store_true',
+        help='Always use headless browser for URLs (requires playwright)'
+    )
+    js_group.add_argument(
+        '--no-render-js',
+        action='store_true',
+        help='Never use headless browser, even for JS-rendered pages'
+    )
+    parser.add_argument(
+        '--wait-time',
+        type=int,
+        default=5000,
+        metavar='MS',
+        help='Time to wait for JS rendering in milliseconds (default: 5000)'
+    )
+    
     args = parser.parse_args()
+    
+    # Determine render mode
+    if args.render_js:
+        render_js_mode = 'always'
+    elif args.no_render_js:
+        render_js_mode = 'never'
+    else:
+        render_js_mode = 'auto'
     
     # Ensure output directory exists
     output_dir = args.output_dir
@@ -462,7 +667,7 @@ def main():
     fail_count = 0
     
     for input_path in args.inputs:
-        if process_input(input_path, output_dir):
+        if process_input(input_path, output_dir, render_js_mode, args.wait_time):
             success_count += 1
         else:
             fail_count += 1
